@@ -47,9 +47,9 @@ def rate_limit_check(session_id: str, user_message: str = "balance") -> None:
     count = _session_counts.get(session_id, 0) + 1
     _session_counts[session_id] = count
     if count > 20:
-        raise RuntimeError(
-            f"Rate limit exceeded: {count} financial queries in session {session_id}"
-        )
+        # Do not expose session_id or count to callers — log internally only
+        write_audit_log_entry({"session_id": session_id, "event": "rate_limit_exceeded", "count": count})
+        raise RuntimeError("Rate limit exceeded. Please contact support.")
 
 
 def write_audit_log_entry(event: dict) -> None:
@@ -64,15 +64,23 @@ def write_audit_log_entry(event: dict) -> None:
         f.write(json.dumps(entry) + "\n")
 
 
+def sanitize_input(user_message: str) -> str:
+    """Strip control characters and enforce max length (PCI DSS Req 6 — input validation)."""
+    sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", user_message)
+    return sanitized[:4096]
+
+
 def run_with_guardrails(user_message: str, session_id: str) -> str:
-    """Chain rate limit, call Claude, PII filter, then write audit log."""
-    rate_limit_check(session_id, user_message)
-    raw = call_claude(user_message)
+    """Chain input validation, rate limit, call Claude, PII filter, then write audit log."""
+    clean_message = sanitize_input(user_message)
+    rate_limit_check(session_id, clean_message)
+    raw = call_claude(clean_message)
     filtered = pre_response_pii_filter(raw)
     write_audit_log_entry({
         "session_id": session_id,
-        "financial_query": is_financial_query(user_message),
+        "financial_query": is_financial_query(clean_message),
         "response_length": len(filtered),
+        "input_length": len(clean_message),
     })
     return filtered
 
