@@ -54,16 +54,17 @@ def _load_rate_counts() -> dict[str, int]:
 
 
 def _save_rate_counts(counts: dict[str, int]) -> None:
-    """Atomically persist rate-limit counts with exclusive locking."""
+    """Persist rate-limit counts with atomic permissions and exclusive locking (PCI DSS Req 10.7)."""
     _RATE_LIMIT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_RATE_LIMIT_PATH, "w", encoding="utf-8") as f:
+    # O_TRUNC overwrites; 0o600 on O_CREAT so the file is never readable by others
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(_RATE_LIMIT_PATH), flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
             f.write(json.dumps(counts))
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
-    # Restrict state file to owner only — contains session identifiers (PCI DSS Req 10.7)
-    os.chmod(_RATE_LIMIT_PATH, 0o600)
 
 
 def is_financial_query(user_message: str) -> bool:
@@ -100,22 +101,22 @@ def rate_limit_check(session_id: str, user_message: str = "balance") -> None:
 
 
 def write_audit_log_entry(event: dict) -> None:
-    """Append a JSONL audit record with file locking to prevent race conditions (PCI DSS Req 10)."""
+    """Append a JSONL audit record with atomic permissions and file locking (PCI DSS Req 10)."""
     AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "event_type": "CHATBOT_TOOL_CALL",
         **event,
     }
-    # Exclusive lock prevents concurrent write corruption
-    with open(AUDIT_PATH, "a", encoding="utf-8") as f:
+    # Open with O_CREAT so the file is created at 0o600 from the start — no race window
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    fd = os.open(str(AUDIT_PATH), flags, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
             f.write(json.dumps(entry) + "\n")
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
-    # Restrict audit log to owner only (PCI DSS Req 10.7)
-    os.chmod(AUDIT_PATH, 0o600)
 
 
 def sanitize_input(user_message: str) -> str:
