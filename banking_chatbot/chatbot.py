@@ -5,7 +5,11 @@ Extended in Module 6 Project 3 with PCI DSS compliance guardrails.
 
 from __future__ import annotations
 
+import json
 import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -19,11 +23,58 @@ FINANCIAL_KEYWORDS = frozenset({
     "credit", "debit", "transaction", "payment",
 })
 
+_session_counts: dict[str, int] = {}
+AUDIT_PATH = Path("audit_log/chatbot_tool_calls.jsonl")
+
 
 def is_financial_query(user_message: str) -> bool:
     """Return True if the message looks like a financial query."""
     tokens = set(user_message.lower().split())
     return bool(tokens & FINANCIAL_KEYWORDS)
+
+
+def pre_response_pii_filter(response: str) -> str:
+    """Redact card numbers (PCI DSS Req 3) and account numbers from responses."""
+    response = re.sub(r"\b\d{13,19}\b", "[REDACTED-CARD]", response)
+    response = re.sub(r"\b\d{8,12}\b", "[REDACTED-ACCT]", response)
+    return response
+
+
+def rate_limit_check(session_id: str, user_message: str = "balance") -> None:
+    """Raise after 20 financial queries per session (PCI DSS Req 6)."""
+    if not is_financial_query(user_message):
+        return
+    count = _session_counts.get(session_id, 0) + 1
+    _session_counts[session_id] = count
+    if count > 20:
+        raise RuntimeError(
+            f"Rate limit exceeded: {count} financial queries in session {session_id}"
+        )
+
+
+def write_audit_log_entry(event: dict) -> None:
+    """Append a JSONL audit record (PCI DSS Req 10)."""
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_type": "CHATBOT_TOOL_CALL",
+        **event,
+    }
+    with open(AUDIT_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def run_with_guardrails(user_message: str, session_id: str) -> str:
+    """Chain rate limit, call Claude, PII filter, then write audit log."""
+    rate_limit_check(session_id, user_message)
+    raw = call_claude(user_message)
+    filtered = pre_response_pii_filter(raw)
+    write_audit_log_entry({
+        "session_id": session_id,
+        "financial_query": is_financial_query(user_message),
+        "response_length": len(filtered),
+    })
+    return filtered
 
 
 def call_claude(user_message: str, tools: list[dict[str, Any]] | None = None) -> str:
