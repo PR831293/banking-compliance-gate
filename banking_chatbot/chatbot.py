@@ -5,6 +5,7 @@ Extended in Module 6 Project 3 with PCI DSS compliance guardrails.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -23,6 +24,13 @@ FINANCIAL_KEYWORDS = frozenset({
     "credit", "debit", "transaction", "payment",
 })
 
+# Patterns that suggest injection attempts (PCI DSS Req 6)
+_INJECTION_PATTERN = re.compile(
+    r"(--|;|\bDROP\b|\bSELECT\b|\bINSERT\b|\bUPDATE\b|\bDELETE\b"
+    r"|\bEXEC\b|\bSCRIPT\b|<[a-z]|\$\{|\beval\b|\bexec\b)",
+    re.IGNORECASE,
+)
+
 _session_counts: dict[str, int] = {}
 AUDIT_PATH = Path("audit_log/chatbot_tool_calls.jsonl")
 
@@ -34,8 +42,13 @@ def is_financial_query(user_message: str) -> bool:
 
 
 def pre_response_pii_filter(response: str) -> str:
-    """Redact card numbers (PCI DSS Req 3) and account numbers from responses."""
+    """Redact card/account numbers (PCI DSS Req 3) — handles plain, spaced, and dashed formats."""
+    # Remove formatting characters before digit-count checks
+    normalized = re.sub(r"[\s\-]", "", response)
+    # Redact 13–19 consecutive digits (card numbers)
+    response = re.sub(r"\b\d[\d \-]{11,17}\d\b", "[REDACTED-CARD]", response)
     response = re.sub(r"\b\d{13,19}\b", "[REDACTED-CARD]", response)
+    # Redact 8–12 consecutive digits (account numbers)
     response = re.sub(r"\b\d{8,12}\b", "[REDACTED-ACCT]", response)
     return response
 
@@ -53,21 +66,32 @@ def rate_limit_check(session_id: str, user_message: str = "balance") -> None:
 
 
 def write_audit_log_entry(event: dict) -> None:
-    """Append a JSONL audit record (PCI DSS Req 10)."""
+    """Append a JSONL audit record with file locking to prevent race conditions (PCI DSS Req 10)."""
     AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "event_type": "CHATBOT_TOOL_CALL",
         **event,
     }
+    # Use exclusive lock to prevent concurrent write corruption
     with open(AUDIT_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(entry) + "\n")
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def sanitize_input(user_message: str) -> str:
-    """Strip control characters and enforce max length (PCI DSS Req 6 — input validation)."""
+    """Validate and sanitize input: strip control chars, check length, reject injection patterns (PCI DSS Req 6)."""
+    # Strip control characters
     sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", user_message)
-    return sanitized[:4096]
+    # Enforce maximum length
+    sanitized = sanitized[:4096]
+    # Reject inputs containing injection patterns
+    if _INJECTION_PATTERN.search(sanitized):
+        raise ValueError("Input contains disallowed patterns. Please rephrase your request.")
+    return sanitized
 
 
 def run_with_guardrails(user_message: str, session_id: str) -> str:
