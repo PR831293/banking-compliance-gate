@@ -62,6 +62,8 @@ def _save_rate_counts(counts: dict[str, int]) -> None:
             f.write(json.dumps(counts))
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+    # Restrict state file to owner only — contains session identifiers (PCI DSS Req 10.7)
+    os.chmod(_RATE_LIMIT_PATH, 0o600)
 
 
 def is_financial_query(user_message: str) -> bool:
@@ -112,6 +114,8 @@ def write_audit_log_entry(event: dict) -> None:
             f.write(json.dumps(entry) + "\n")
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+    # Restrict audit log to owner only (PCI DSS Req 10.7)
+    os.chmod(AUDIT_PATH, 0o600)
 
 
 def sanitize_input(user_message: str) -> str:
