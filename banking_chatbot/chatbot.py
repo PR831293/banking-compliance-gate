@@ -31,8 +31,37 @@ _INJECTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_session_counts: dict[str, int] = {}
-AUDIT_PATH = Path("audit_log/chatbot_tool_calls.jsonl")
+# Absolute audit log path — resolved relative to this file so it is stable
+# regardless of the working directory.  Override with AUDIT_LOG_PATH env var.
+_DEFAULT_AUDIT_DIR = Path(__file__).resolve().parent.parent / "audit_log"
+AUDIT_PATH = Path(os.environ.get("AUDIT_LOG_PATH",
+                                  str(_DEFAULT_AUDIT_DIR / "chatbot_tool_calls.jsonl")))
+
+# Rate-limit state backed by a file so counts survive process restarts
+# (PCI DSS Req 6).  File path follows the same env-var override pattern.
+_RATE_LIMIT_PATH = Path(os.environ.get("RATE_LIMIT_STATE_PATH",
+                                        str(_DEFAULT_AUDIT_DIR / ".rate_limit_state.json")))
+
+
+def _load_rate_counts() -> dict[str, int]:
+    """Load per-session financial query counts from the persistent state file."""
+    if not _RATE_LIMIT_PATH.exists():
+        return {}
+    try:
+        return json.loads(_RATE_LIMIT_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_rate_counts(counts: dict[str, int]) -> None:
+    """Atomically persist rate-limit counts with exclusive locking."""
+    _RATE_LIMIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_RATE_LIMIT_PATH, "w", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(counts))
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def is_financial_query(user_message: str) -> bool:
@@ -43,9 +72,7 @@ def is_financial_query(user_message: str) -> bool:
 
 def pre_response_pii_filter(response: str) -> str:
     """Redact card/account numbers (PCI DSS Req 3) — handles plain, spaced, and dashed formats."""
-    # Remove formatting characters before digit-count checks
-    normalized = re.sub(r"[\s\-]", "", response)
-    # Redact 13–19 consecutive digits (card numbers)
+    # Redact 13–19 consecutive digits with optional spaces/dashes (card numbers)
     response = re.sub(r"\b\d[\d \-]{11,17}\d\b", "[REDACTED-CARD]", response)
     response = re.sub(r"\b\d{13,19}\b", "[REDACTED-CARD]", response)
     # Redact 8–12 consecutive digits (account numbers)
@@ -54,11 +81,16 @@ def pre_response_pii_filter(response: str) -> str:
 
 
 def rate_limit_check(session_id: str, user_message: str = "balance") -> None:
-    """Raise after 20 financial queries per session (PCI DSS Req 6)."""
+    """Raise after 20 financial queries per session (PCI DSS Req 6).
+
+    Counts are persisted to a file so they survive process restarts.
+    """
     if not is_financial_query(user_message):
         return
-    count = _session_counts.get(session_id, 0) + 1
-    _session_counts[session_id] = count
+    counts = _load_rate_counts()
+    count = counts.get(session_id, 0) + 1
+    counts[session_id] = count
+    _save_rate_counts(counts)
     if count > 20:
         # Do not expose session_id or count to callers — log internally only
         write_audit_log_entry({"session_id": session_id, "event": "rate_limit_exceeded", "count": count})
@@ -73,7 +105,7 @@ def write_audit_log_entry(event: dict) -> None:
         "event_type": "CHATBOT_TOOL_CALL",
         **event,
     }
-    # Use exclusive lock to prevent concurrent write corruption
+    # Exclusive lock prevents concurrent write corruption
     with open(AUDIT_PATH, "a", encoding="utf-8") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
@@ -83,12 +115,9 @@ def write_audit_log_entry(event: dict) -> None:
 
 
 def sanitize_input(user_message: str) -> str:
-    """Validate and sanitize input: strip control chars, check length, reject injection patterns (PCI DSS Req 6)."""
-    # Strip control characters
+    """Validate and sanitize input: strip control chars, enforce length, reject injection (PCI DSS Req 6)."""
     sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", user_message)
-    # Enforce maximum length
     sanitized = sanitized[:4096]
-    # Reject inputs containing injection patterns
     if _INJECTION_PATTERN.search(sanitized):
         raise ValueError("Input contains disallowed patterns. Please rephrase your request.")
     return sanitized
